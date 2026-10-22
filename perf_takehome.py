@@ -56,7 +56,8 @@ class Graph:
 
     Engine classes: "valu", "alu", "flow", "load", "store" are fixed; "flex" is an
     element-wise vector op the scheduler may run as 1 VALU slot or 8 ALU slots;
-    "cst" makes a scalar constant with load const or flow add_imm; "sel" is a
+    "cst" makes a scalar constant with load const, flow add_imm or (given recipes,
+    see add_recipes) one ALU op on words already holding known values; "sel" is a
     select between constant vectors, on flow or (as a multiply_add) on VALU.
     """
 
@@ -64,6 +65,7 @@ class Graph:
         self.width = []
         self.ops = []
         self.zero = self.new(1)   # never written: scratch starts zeroed
+        self.known = {(self.zero, 0): 0}   # word -> value it holds once written
         self.ctx = None           # (group, round) of the ops being emitted
 
     def new(self, width=8):
@@ -120,10 +122,46 @@ class Graph:
         self.emit("alu", (op, W(d, d_off), W(a, a_off), W(b, b_off)),
                   [(a, a_off), (b, b_off)], [(d, d_off)])
 
-    def const(self, val):
-        d = self.new(1)
-        self.emit("cst", ("const", W(d), val % M32), [], [(d, 0)])
+    def const(self, val, dest=None, dest_off=0):
+        d = self.new(1) if dest is None else dest
+        self.emit("cst", ("const", W(d, dest_off), val % M32), [], [(d, dest_off)])
+        self.known[(d, dest_off)] = val % M32
         return d
+
+    def add_recipes(self, limit=64):
+        """give each constant op its ALU recipes: (op, a, b) with words a, b of
+        known value and a op b == the constant. Only words written once qualify."""
+        n_writes = {}
+        for op in self.ops:
+            for w in op["writes"]:
+                n_writes[w] = n_writes.get(w, 0) + 1
+        by_val = {}
+        for w, v in self.known.items():
+            if n_writes.get(w, 0) <= 1:
+                by_val.setdefault(v, []).append(w)
+        vals = list(by_val)
+        for i, op in enumerate(self.ops):
+            if op["cls"] != "cst":
+                continue
+            x, me = op["ins"][2], op["writes"][0]
+            out = []
+            def add(o, a, b):
+                for wa in by_val.get(a % M32, ()):
+                    for wb in by_val.get(b % M32, ()):
+                        if wa != me and wb != me:
+                            out.append((o, wa, wb))
+                            return
+            for a in vals:
+                add("+", a, x - a)
+                add("-", a, a - x)
+                add("^", a, a ^ x)
+                if 0 < a < 64 and x % a == 0:
+                    add("*", a, x // a)
+                if a and a < 32 and x % (1 << a) == 0:
+                    add("<<", x >> a, a)
+                if len(out) >= limit:
+                    break
+            op["recipes"] = out[:limit]
 
     def vload(self, addr, addr_off=0, dest=None, dest_off=0, mem_reads=()):
         d = self.new() if dest is None else dest
@@ -174,7 +212,7 @@ SLOTS = {"valu": 6, "alu": 12, "flow": 1, "load": 2, "store": 2}
 
 
 def schedule(g, prio, valu_only_first=True, sel_valu_penalty=0.0, sel_spill_wait=0,
-             alu_first=False, alu_reserve=0, cst_flow=True):
+             alu_first=False, alu_reserve=0, cst_flow=True, cst_alu_cycles=0):
     """
     Cycle-by-cycle list scheduler. Each cycle takes ready ops in priority order
     (higher first) until the engines are full. A flex op on the ALU may spread its
@@ -183,7 +221,9 @@ def schedule(g, prio, valu_only_first=True, sel_valu_penalty=0.0, sel_spill_wait
     lanes[i] (for split ALU flex ops: the cycle of each lane). A "sel" op only
     moves to the VALU after waiting sel_spill_wait cycles for the flow slot. With
     alu_first, flex ops fill the ALU before the VALU each cycle, so the VALU is
-    left for the ops only it can run.
+    left for the ops only it can run. A constant with recipes takes an ALU slot
+    when a recipe's inputs are ready: before load/flow in the first cst_alu_cycles
+    cycles, else when no load/flow slot took it.
     """
     ops = g.ops
     n = len(ops)
@@ -204,6 +244,8 @@ def schedule(g, prio, valu_only_first=True, sel_valu_penalty=0.0, sel_spill_wait
     engine = [None] * n
     lanes = {}
     partial = None        # (op, lanes issued so far) of a flex op split over cycles
+    avail = {(g.zero, 0): 0}   # word -> first cycle it can be read
+    recipe = {}           # constant op -> the ALU recipe it used
     done, c = 0, 0
     while done < n:
         for i in waiting.pop(c, ()):
@@ -217,6 +259,8 @@ def schedule(g, prio, valu_only_first=True, sel_valu_penalty=0.0, sel_spill_wait
                 first[i] = c
             used[eng] += cost
             done += 1
+            for w in ops[i]["writes"]:
+                avail[w] = c + 1
             for j, lat in succ[i].items():
                 earliest[j] = max(earliest[j], c + lat)
                 npred[j] -= 1
@@ -280,9 +324,27 @@ def schedule(g, prio, valu_only_first=True, sel_valu_penalty=0.0, sel_spill_wait
                 got = True
             return got
 
+        def alu_consts():
+            """constants with a ready recipe onto free ALU slots, by priority"""
+            hcs, keep, got = heaps["cst"], [], False
+            while hcs and used["alu"] < SLOTS["alu"]:
+                item = heapq.heappop(hcs)
+                r = next((r for r in ops[item[1]].get("recipes", ())
+                          if avail.get(r[1], c + 1) <= c and avail.get(r[2], c + 1) <= c), None)
+                if r is None:
+                    keep.append(item)
+                    continue
+                recipe[item[1]] = r
+                place(item[1], "alu"); got = True
+            for item in keep:
+                heapq.heappush(hcs, item)
+            return got
+
         progress = True
         while progress:   # WAR successors (latency 0) may join the same cycle
             progress = False
+            if c < cst_alu_cycles:
+                progress |= alu_consts()
             hst, hcs = heaps["store"], heaps["cst"]
             while hst and used["store"] < SLOTS["store"]:
                 place(heapq.heappop(hst)[1], "store"); progress = True
@@ -300,9 +362,13 @@ def schedule(g, prio, valu_only_first=True, sel_valu_penalty=0.0, sel_spill_wait
             progress |= fill_valu()
             if not alu_first:
                 progress |= fill_alu()
+            progress |= alu_consts()
         c += 1
         if c > 100000:
             raise RuntimeError("scheduler stuck")
+    for i, (o, a, b) in recipe.items():   # the chosen recipe's inputs are now read
+        ops[i]["reads"] = ops[i]["reads"] + [a, b]
+        ops[i]["alu_ins"] = (o, W(*ops[i]["writes"][0]), W(*a), W(*b))
     return cycle, first, engine, lanes
 
 
@@ -323,6 +389,8 @@ def allocate(g, cycle, first):
         for w in op["writes"]:
             wstart[w] = min(wstart.get(w, t0), t0)
             wend[w] = max(wend.get(w, t + 1), t + 1)   # a write in cycle t holds t
+    for i, op in enumerate(g.ops):   # (a constant's recipe may read a later op's word)
+        t = cycle[i]
         for w in op["reads"]:
             if w in wstart:
                 wend[w] = max(wend[w], t)
@@ -376,6 +444,8 @@ def lower(g, cycle, engine, lanes, base):
         elif op["cls"] == "sel" and eng == "valu":
             alt = op["alt"]
             out.append((alt[0],) + tuple(addr(x) for x in alt[1:]))
+        elif op["cls"] == "cst" and eng == "alu":
+            out.append((op["alu_ins"][0],) + tuple(addr(x) for x in op["alu_ins"][1:]))
         elif op["cls"] == "cst" and eng == "flow":
             out.append(("add_imm", addr(ins[1]), base[g.zero], ins[2]))
         else:
@@ -391,71 +461,122 @@ TUNED_SCHEDULE = {
     "ADDR9_DIGIT": 1.0,
     "ALU_RESERVE": 1,
     "CONTEXT_OFFSET": {
-        (0, 0): 2, (0, 1): -2, (0, 5): -2, (0, 7): -6, (0, 9): -2, (0, 10): -12,
-        (0, 13): 2, (1, 1): 4, (1, 5): -8, (1, 7): -2, (1, 14): -12, (1, 15): -6,
-        (2, 0): -4, (2, 4): 2, (2, 7): 0, (2, 9): 2, (3, 0): -8, (3, 1): -2,
-        (3, 2): 4, (3, 4): 8, (3, 6): 4, (3, 7): -8, (3, 10): 2, (3, 13): 4,
-        (4, -1): -2, (4, 0): 4, (4, 1): 2, (4, 2): 12, (4, 4): 2, (4, 5): -2,
-        (4, 7): 8, (4, 10): -8, (4, 13): 4, (4, 14): 2, (4, 16): 2, (5, 5): 8,
-        (5, 6): -8, (5, 7): 2, (5, 8): -4, (5, 9): -8, (5, 14): -6, (5, 16): -2,
-        (6, 4): 2, (6, 6): -2, (6, 8): -2, (6, 10): 2, (6, 11): -2, (6, 13): 2,
-        (6, 15): 0, (7, 1): -8, (7, 2): 6, (7, 13): -16, (7, 14): 12, (7, 15): 2,
-        (7, 16): 8, (8, -1): 0, (8, 4): 4, (8, 5): -8, (8, 10): 12, (8, 11): 2,
-        (8, 12): 8, (9, 0): 2, (9, 3): 4, (9, 6): -2, (9, 9): -8, (10, 2): 2,
-        (10, 5): -2, (10, 7): 2, (10, 11): 2, (10, 12): 8, (10, 14): -8,
-        (10, 15): 4, (11, -1): -2, (11, 3): 2, (11, 4): 4, (11, 13): 0,
-        (12, -1): -2, (12, 0): -2, (12, 3): -2, (12, 5): 4, (12, 9): 4,
-        (12, 10): -2, (12, 13): 8, (12, 16): -8, (13, 0): 12, (13, 2): 2,
-        (13, 3): -4, (13, 7): -10, (13, 13): -4, (14, 0): -2, (14, 1): -4,
-        (14, 6): -4, (14, 10): 4, (14, 12): -2, (14, 14): -4, (15, -1): 4,
-        (15, 0): 4, (15, 1): 6, (15, 4): -4, (15, 5): 8, (15, 6): 8, (15, 7): 2,
-        (15, 8): -4, (15, 9): 4, (15, 10): -4, (15, 12): -8, (15, 13): 2,
-        (16, -1): 10, (16, 3): -8, (16, 4): 8, (16, 5): 8, (16, 7): 2, (16, 8): 8,
-        (16, 10): -8, (16, 11): 8, (16, 13): -8, (16, 16): 0, (17, 0): 8,
-        (17, 1): -8, (17, 4): -8, (17, 8): -8, (17, 10): 8, (17, 11): 0, (18, 4): 4,
-        (18, 7): 4, (18, 10): 8, (18, 13): 4, (18, 14): -2, (18, 16): -4,
-        (19, -1): 4, (19, 2): 4, (19, 3): -2, (19, 4): 4, (19, 11): -8, (19, 13): 2,
-        (19, 14): -2, (19, 15): 0, (19, 16): 4, (20, 0): 2, (20, 5): 8,
-        (20, 11): -4, (20, 12): 6, (20, 14): 2, (20, 15): -8, (21, 3): 4,
-        (21, 4): 2, (21, 5): -4, (21, 6): -6, (21, 8): 8, (21, 9): -4, (21, 10): -6,
-        (21, 11): 4, (21, 13): 2, (21, 15): -4, (21, 16): -8, (22, 2): -12,
-        (22, 3): 2, (22, 4): 4, (22, 5): 4, (22, 6): 8, (22, 7): 6, (22, 8): 2,
-        (22, 11): -8, (22, 12): 4, (22, 13): 0, (23, 4): 4, (23, 6): 2,
-        (23, 10): -4, (23, 11): -8, (23, 12): -4, (23, 13): 2, (23, 16): 10,
-        (24, 3): 2, (24, 6): -2, (24, 7): 2, (24, 9): 2, (24, 14): 4, (24, 16): -2,
-        (25, 0): 8, (25, 3): 12, (25, 4): -2, (25, 5): -6, (25, 6): 2, (25, 12): -6,
-        (25, 15): -8, (25, 16): 8, (26, -1): -4, (26, 1): 4, (26, 2): 4,
-        (26, 3): -4, (26, 4): -8, (26, 10): -4, (26, 11): -2, (26, 13): -2,
-        (26, 14): 8, (27, -1): 4, (27, 0): 4, (27, 1): -10, (27, 2): -2, (27, 7): 2,
-        (27, 11): -2, (27, 12): 8, (27, 13): -4, (27, 15): -2, (27, 16): -8,
-        (28, -1): -4, (28, 2): 10, (28, 3): 8, (28, 5): 0, (28, 6): -8, (28, 7): 4,
-        (28, 10): 4, (28, 14): 8, (29, -1): 2, (29, 4): 2, (29, 7): 2, (29, 11): 4,
-        (29, 12): -2, (29, 13): 8, (30, -1): 8, (30, 0): 4, (30, 8): 4, (30, 10): 2,
-        (30, 15): -4, (30, 16): 0, (31, 2): 10, (31, 4): -4, (31, 6): 8, (31, 7): 2,
-        (31, 11): -8,
+        (0, -1): 4, (0, 0): -2, (0, 1): -4, (0, 2): 2, (0, 4): -4, (0, 5): -4,
+        (0, 6): 4, (0, 7): -8, (0, 9): 6, (0, 10): -16, (0, 12): 2, (0, 13): 0,
+        (0, 14): -10, (0, 15): -2, (1, -1): -2, (1, 1): 4, (1, 2): -8, (1, 3): 8,
+        (1, 4): 6, (1, 5): 8, (1, 6): -6, (1, 7): -2, (1, 8): 16, (1, 9): 8,
+        (1, 12): -8, (1, 13): 4, (1, 14): 4, (1, 15): -2, (1, 16): 4, (2, -1): 0,
+        (2, 0): -8, (2, 1): -8, (2, 2): 2, (2, 3): -4, (2, 4): 2, (2, 6): 8,
+        (2, 7): -8, (2, 9): 12, (2, 11): 0, (2, 12): 6, (2, 14): 8, (2, 15): 4,
+        (2, 16): 6, (3, -1): -8, (3, 0): -8, (3, 1): -4, (3, 2): 4, (3, 3): 4,
+        (3, 4): 8, (3, 6): 4, (3, 7): -8, (3, 9): -2, (3, 10): -4, (3, 11): -8,
+        (3, 13): 12, (3, 15): -8, (3, 16): -10, (4, -1): -2, (4, 0): 10, (4, 1): 6,
+        (4, 2): 6, (4, 3): 2, (4, 4): 2, (4, 5): -2, (4, 7): 8, (4, 9): 2,
+        (4, 10): -12, (4, 12): -4, (4, 13): 4, (4, 14): 2, (4, 15): -4, (4, 16): 2,
+        (5, 0): 2, (5, 1): -4, (5, 2): -8, (5, 4): 10, (5, 5): 2, (5, 6): -6,
+        (5, 7): -2, (5, 8): -2, (5, 9): -16, (5, 11): -2, (5, 12): 0, (5, 13): 12,
+        (5, 14): -14, (5, 15): 0, (5, 16): -6, (6, -1): 0, (6, 0): 4, (6, 1): 8,
+        (6, 2): 4, (6, 4): 2, (6, 5): -6, (6, 6): 2, (6, 7): -4, (6, 8): 6,
+        (6, 9): -6, (6, 10): 4, (6, 11): -6, (6, 13): 6, (6, 14): 2, (6, 15): 4,
+        (6, 16): 4, (7, -1): -2, (7, 0): -8, (7, 1): 0, (7, 2): 6, (7, 5): -6,
+        (7, 6): 6, (7, 7): -2, (7, 8): -4, (7, 9): -8, (7, 10): 4, (7, 11): -2,
+        (7, 13): -16, (7, 14): 10, (7, 15): 2, (7, 16): 12, (8, -1): -2, (8, 0): 8,
+        (8, 3): -6, (8, 4): 0, (8, 5): 0, (8, 8): -2, (8, 9): -8, (8, 10): 4,
+        (8, 11): 2, (8, 12): 6, (8, 14): -4, (8, 15): 10, (9, 0): 4, (9, 3): 4,
+        (9, 4): 2, (9, 5): -4, (9, 6): -2, (9, 7): 2, (9, 8): 4, (9, 9): -8,
+        (9, 10): 4, (9, 11): -2, (9, 12): -4, (9, 14): -4, (9, 16): 6, (10, -1): 6,
+        (10, 0): 2, (10, 1): -8, (10, 2): -6, (10, 4): 4, (10, 5): -2, (10, 7): 2,
+        (10, 8): 10, (10, 11): 4, (10, 12): 8, (10, 13): -2, (10, 14): 0,
+        (10, 15): 4, (11, -1): 0, (11, 0): 4, (11, 1): -2, (11, 2): -6, (11, 3): -2,
+        (11, 4): 4, (11, 7): -4, (11, 9): 4, (11, 10): -12, (11, 11): -10,
+        (11, 12): 8, (11, 13): 8, (11, 14): -2, (11, 16): 4, (12, -1): -2,
+        (12, 0): -6, (12, 2): 8, (12, 3): -6, (12, 4): 4, (12, 5): 12, (12, 9): 4,
+        (12, 10): -2, (12, 11): 6, (12, 12): 12, (12, 13): 8, (12, 14): 2,
+        (12, 16): -8, (13, -1): 8, (13, 0): 16, (13, 1): 8, (13, 2): 10, (13, 3): 0,
+        (13, 5): 8, (13, 6): 12, (13, 7): -10, (13, 8): 2, (13, 9): 10, (13, 10): 8,
+        (13, 11): 4, (13, 13): -8, (13, 14): 4, (14, -1): 2, (14, 0): 0,
+        (14, 1): -12, (14, 2): -6, (14, 5): 2, (14, 6): -12, (14, 7): -2,
+        (14, 8): -2, (14, 9): -4, (14, 10): 4, (14, 12): -2, (14, 14): -4,
+        (14, 15): -14, (14, 16): -8, (15, -1): 4, (15, 0): -4, (15, 1): 8,
+        (15, 2): -4, (15, 3): -4, (15, 4): -4, (15, 5): 8, (15, 6): 8, (15, 7): 4,
+        (15, 8): -6, (15, 9): 4, (15, 10): -8, (15, 11): -6, (15, 12): -12,
+        (15, 13): 2, (15, 14): -8, (15, 15): -10, (16, -1): 6, (16, 1): -4,
+        (16, 2): -4, (16, 3): -20, (16, 4): 8, (16, 5): 10, (16, 6): -4,
+        (16, 7): -2, (16, 8): 12, (16, 9): 4, (16, 10): 2, (16, 11): 8, (16, 12): 8,
+        (16, 13): -6, (16, 14): 2, (16, 15): 4, (16, 16): 8, (17, -1): -8,
+        (17, 0): 16, (17, 1): -6, (17, 2): 2, (17, 4): -12, (17, 5): -6,
+        (17, 6): -6, (17, 8): -8, (17, 10): 8, (17, 11): -4, (17, 12): 0,
+        (17, 13): 8, (17, 14): -4, (17, 16): 2, (18, -1): -4, (18, 0): 8,
+        (18, 1): 8, (18, 4): 4, (18, 5): 12, (18, 7): 4, (18, 8): -4, (18, 9): -2,
+        (18, 10): 4, (18, 11): -2, (18, 13): 10, (18, 14): -2, (18, 16): 4,
+        (19, -1): 4, (19, 0): 2, (19, 1): -4, (19, 2): 4, (19, 3): -4, (19, 4): 8,
+        (19, 5): 6, (19, 7): -6, (19, 8): 6, (19, 9): 2, (19, 10): 4, (19, 11): -8,
+        (19, 12): -12, (19, 13): 0, (19, 14): -2, (19, 15): 10, (19, 16): 2,
+        (20, -1): -4, (20, 0): 10, (20, 1): -4, (20, 4): -2, (20, 5): 0,
+        (20, 6): -8, (20, 7): -2, (20, 9): -8, (20, 10): -6, (20, 11): -12,
+        (20, 12): 10, (20, 13): -4, (20, 14): -6, (20, 15): -8, (21, -1): 0,
+        (21, 0): -4, (21, 3): 2, (21, 4): 2, (21, 5): -8, (21, 6): -6, (21, 7): -6,
+        (21, 8): 4, (21, 9): -4, (21, 10): -8, (21, 11): 4, (21, 13): 4,
+        (21, 14): 2, (21, 15): 4, (21, 16): -10, (22, -1): 4, (22, 1): 0,
+        (22, 2): -20, (22, 3): 2, (22, 4): -8, (22, 5): 12, (22, 6): 10, (22, 7): 6,
+        (22, 8): 2, (22, 11): -10, (22, 12): 8, (22, 13): -4, (22, 14): -4,
+        (22, 16): 2, (23, -1): -8, (23, 0): -4, (23, 4): 8, (23, 5): 4, (23, 6): 2,
+        (23, 8): 6, (23, 9): -16, (23, 10): -4, (23, 11): -6, (23, 12): -6,
+        (23, 13): 2, (23, 14): 0, (23, 16): 10, (24, -1): -4, (24, 0): 2,
+        (24, 1): 8, (24, 2): 8, (24, 3): -2, (24, 6): -10, (24, 7): -6, (24, 9): 2,
+        (24, 10): 8, (24, 11): -6, (24, 12): 2, (24, 13): 8, (24, 14): -4,
+        (24, 15): 6, (24, 16): -2, (25, 0): 16, (25, 1): 12, (25, 2): -2,
+        (25, 3): 12, (25, 4): -2, (25, 5): -6, (25, 6): 14, (25, 7): -2,
+        (25, 8): -6, (25, 9): -4, (25, 12): -6, (25, 13): -2, (25, 15): -8,
+        (25, 16): 8, (26, -1): -4, (26, 1): 8, (26, 2): 4, (26, 3): -4,
+        (26, 4): -16, (26, 5): -2, (26, 7): -6, (26, 10): -12, (26, 11): 6,
+        (26, 12): 4, (26, 13): -4, (26, 14): 8, (26, 15): 10, (26, 16): -8,
+        (27, -1): 8, (27, 0): 4, (27, 1): -10, (27, 2): -8, (27, 3): -8, (27, 4): 2,
+        (27, 6): -2, (27, 7): 6, (27, 8): -8, (27, 9): -4, (27, 10): 8,
+        (27, 11): -4, (27, 12): 8, (27, 13): -4, (27, 14): 4, (27, 15): -4,
+        (27, 16): -8, (28, -1): -2, (28, 2): 12, (28, 3): 8, (28, 4): 0,
+        (28, 5): -12, (28, 6): -6, (28, 7): 8, (28, 8): -4, (28, 9): 8,
+        (28, 10): 14, (28, 11): -10, (28, 12): 4, (28, 14): 8, (28, 16): 4,
+        (29, -1): 8, (29, 0): -2, (29, 3): -8, (29, 4): -6, (29, 5): -4, (29, 7): 4,
+        (29, 8): -6, (29, 9): -2, (29, 11): -4, (29, 12): -10, (29, 13): 8,
+        (29, 14): -8, (29, 16): 4, (30, -1): 16, (30, 0): 4, (30, 2): 4, (30, 3): 6,
+        (30, 4): -4, (30, 5): 12, (30, 6): -6, (30, 8): 2, (30, 10): 2, (30, 11): 8,
+        (30, 12): -6, (30, 13): 0, (30, 14): 8, (30, 15): -4, (30, 16): 4,
+        (31, -1): 14, (31, 0): 4, (31, 1): -8, (31, 2): 6, (31, 4): 0, (31, 5): 4,
+        (31, 6): 8, (31, 7): 0, (31, 9): -4, (31, 11): 0, (31, 12): 8, (31, 13): -4,
+        (31, 14): 2, (31, 15): -2,
     },
     "CP_WEIGHT": {
-        'alu': 0.25, 'cst': 0.25, 'flex': 1.25, 'flow': 0.5, 'load': 0.0,
-        'sel': 2.0, 'store': 0.75, 'valu': 2.5,
+        'alu': 2.5, 'cst': 1.75, 'flex': 1.25, 'flow': 0.5, 'load': 1.0,
+        'sel': 1.75, 'store': 0.5, 'valu': 3.25,
     },
+    "CST_ALU_CYCLES": 28,
     "DIGIT7_MADD": 0.0,
-    "FLEX_BCAST": True,
-    "GROUP_BIAS": 8.75,
+    "DUAL_BCAST": True,
+    "DYN_ADDRS": True,
+    "DYN_CONST": True,
+    "FLEX_BCAST": False,
+    "FLOW_BCAST": ['misc'],
+    "GROUP_BIAS": 13.5,
     "GROUP_OFFSET": {
-        0: -10, 1: -4, 2: 2, 3: -4, 4: -2, 5: 8, 6: 4, 7: 4, 8: 8, 9: -10, 10: -6,
-        11: 8, 13: -4, 14: -4, 15: 4, 16: 8, 17: -4, 18: 8, 19: -4, 20: 0, 21: 0,
-        22: -8, 23: 6, 25: 2, 26: 14, 27: -2, 28: -4, 29: -4, 30: 2, 31: 16,
+        0: -14, 1: 28, 2: 0, 3: 14, 4: 4, 5: 24, 6: 0, 7: -12, 8: 20, 9: -26,
+        10: 12, 11: 20, 12: 16, 13: -12, 14: -10, 15: -10, 16: 30, 17: -2, 18: 10,
+        19: 24, 20: 10, 21: 10, 22: -14, 23: 4, 24: 12, 25: -2, 26: -2, 27: 8,
+        28: 16, 29: -6, 30: 4, 31: 16,
     },
-    "N_STAGE": 2,
+    "MEM_BCAST": True,
+    "MEM_KINDS": ['sel'],
+    "N_STAGE": 4,
+    "PAIR_BCAST": False,
     "ROUND_OFFSET": {
-        -1: 26, 0: -18, 1: 4, 2: -2, 3: -4, 4: -16, 5: 0, 6: -10, 7: -14, 8: 2,
-        9: 6, 10: 32, 11: 24, 12: -18, 13: -14, 14: -2, 15: -10, 16: -30,
+        -1: 64, 0: 6, 1: -14, 2: -28, 3: 16, 4: -4, 5: 20, 6: -22, 7: -22, 8: 0,
+        9: 60, 10: 24, 11: 32, 12: -18, 13: -28, 14: -4, 15: -16, 16: -6,
     },
-    "SEL_VALU_PENALTY": 16,
-    "TAIL_BIAS": 1.25,
-    "TAIL_OFFSET": 200.0,
+    "SEL_VALU_PENALTY": -69,
+    "TAIL_BIAS": 1.0,
+    "TAIL_OFFSET": 330.0,
     "USE_CSEL": False,
-    "VALU_ONLY_FIRST": False,
+    "VALU_ONLY_FIRST": True,
 }
 
 
@@ -556,7 +677,12 @@ class KernelBuilder:
             const / add_imm"""
             x %= M32
             if x not in consts:
-                consts[x] = (g.zero, 0) if x == 0 else derive(x) or (g.const(x), 0)
+                if x == 0:
+                    consts[x] = (g.zero, 0)
+                elif self.DYN_CONST:   # the scheduler picks load / flow / ALU recipe
+                    consts[x] = (g.const(x), 0)
+                else:
+                    consts[x] = derive(x) or (g.const(x), 0)
             return consts[x]
 
         if self.HEADER_CONSTS:
@@ -566,6 +692,7 @@ class KernelBuilder:
             hvals = [rounds, n_nodes, batch_size, forest_height, forest_p, indices_p, values_p]
             for k, x in enumerate(hvals):
                 consts.setdefault(x % M32, (header, k))
+                g.known[(header, k)] = x % M32
 
         def derive(x, dest=None, dest_off=0):
             """one ALU op making x from two existing constants (into dest if given)"""
@@ -606,10 +733,12 @@ class KernelBuilder:
         def const_into(dest, off, x):
             """write constant x into word off of dest with a single op"""
             x %= M32
-            if x in consts:
+            if self.DYN_CONST:
+                g.const(x, dest, off)
+            elif x in consts:
                 g.alu("+", dest, off, *consts[x], g.zero, 0)
             elif derive(x, dest, off) is None:
-                g.emit("cst", ("const", W(dest, off), x), [], [(dest, off)])
+                g.const(x, dest, off)
 
         flow_mask = None
         mem_bcast = []   # set once the memory staging areas exist (see vc_late)
@@ -627,28 +756,46 @@ class KernelBuilder:
             pat = g.new(9)
             for k in (1, 3, 5, 7):
                 write(pat, k)
-            return g.vselect(flow_mask, pat, pat, 1, 0)
+            if not self.DUAL_BCAST:
+                return g.vselect(flow_mask, pat, pat, 1, 0)
+            # a "sel" op: the flow vselect, or (when flow is busy) a VALU broadcast
+            # of the pattern's word 1
+            d = g.new()
+            i = g.emit("sel", ("vselect", W(d), W(flow_mask), W(pat, 1), W(pat, 0)),
+                       g.vec(flow_mask) + g.vec(pat, 1) + g.vec(pat, 0), g.vec(d))
+            g.ops[i]["alt"] = ("vbroadcast", W(d), W(pat, 1))
+            return d
 
         def vc(x, kind="misc"):
             x %= M32
             if x not in vconsts:
-                if kind in self.MEM_KINDS and mem_bcast:
-                    vconsts[x] = mem_bcast[0](x)
-                elif kind in self.FLOW_BCAST:
-                    src = sc(x)
-                    vconsts[x] = flow_bcast(lambda d, k: g.alu("+", d, k, *src, g.zero, 0))
-                else:
-                    vconsts[x] = g.broadcast(*sc(x), flex=self.FLEX_BCAST)
+                vc_make(x, kind)
+                g.known[(vconsts[x], 0)] = x
             return vconsts[x]
+
+        def vc_make(x, kind):
+            if kind in self.MEM_KINDS and mem_bcast:
+                vconsts[x] = mem_bcast[0](x)
+            elif kind in self.FLOW_BCAST:
+                src = sc(x)
+                vconsts[x] = flow_bcast(lambda d, k: g.alu("+", d, k, *src, g.zero, 0))
+            else:
+                vconsts[x] = g.broadcast(*sc(x), flex=self.FLEX_BCAST)
 
         def addresses(base_addr, count, stride):
             """count scalar addresses base_addr + stride*i as (register, word), built
             as a tree of ALU adds"""
             out = [sc(base_addr)]
             for i in range(1, count):
+                x = (base_addr + stride * i) % M32
+                if self.DYN_ADDRS:
+                    out.append(consts[x] if x in consts else (g.const(x), 0))
+                    consts.setdefault(x, out[-1])
+                    continue
                 hb = 1 << (i.bit_length() - 1)
                 a = g.new(1)
                 g.alu("+", a, 0, *out[i - hb], *sc(stride * hb))
+                g.known[(a, 0)] = x
                 out.append((a, 0))
                 if self.REG_ADDRS:
                     consts.setdefault((base_addr + stride * i) % M32, (a, 0))
@@ -972,10 +1119,12 @@ class KernelBuilder:
         pause = g.emit("flow", ("pause",), [], [])
 
         # ---- schedule, allocate, lower ---------------------------------------------
+        if self.DYN_CONST:
+            g.add_recipes()
         prio = self.priorities(g, pause)
         cycle, first, engine, lanes = schedule(g, prio, self.VALU_ONLY_FIRST, self.SEL_VALU_PENALTY,
                                                self.SEL_SPILL_WAIT, self.ALU_FIRST, self.ALU_RESERVE,
-                                               self.CST_FLOW)
+                                               self.CST_FLOW, self.CST_ALU_CYCLES)
         base, peak = allocate(g, cycle, first)
         self.scratch_peak = peak
         self.instrs = lower(g, cycle, engine, lanes, base)
@@ -1012,9 +1161,13 @@ class KernelBuilder:
     D2_MADD = False          # depth-2 last level as a multiply_add instead of a vselect
     VLOAD9 = True            # depth-9 gather by vload + word offset (see off9)
     MEM_BCAST = False        # broadcast late vector constants through memory
+    DYN_CONST = False        # constants pick load / flow / an ALU recipe while scheduling
+    DYN_ADDRS = False        # addresses too are such constants (else a tree of adds)
+    CST_ALU_CYCLES = 0       # cycles in which constants try the ALU before load/flow
     DERIVE2 = False          # constants may also take two ALU ops (see derive)
     CST_FLOW = True          # constants may use the flow slot (add_imm)
     REG_ADDRS = False        # addresses join the constants (anchors derive from them)
+    DUAL_BCAST = False       # flow broadcasts may run as VALU broadcasts instead
     FLOW_BCAST = ()          # kinds of vector constants made by a flow vselect (see
                              # flow_bcast): "node", "hash", "misc", "scale", "sel"
     MEM_BCAST_AREAS = 3      # staging areas used for that
