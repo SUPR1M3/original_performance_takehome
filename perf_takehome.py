@@ -773,6 +773,25 @@ class KernelBuilder:
                 g.known[(vconsts[x], 0)] = x
             return vconsts[x]
 
+        def vsynth(x):
+            """x from two (or, as a multiply_add, three) existing vector constants
+            with one op, else a broadcast"""
+            have = list(vconsts.items())
+            for a, va in have:
+                for b, vb in have:
+                    for op, val in (("+", a + b), ("-", a - b), ("*", a * b),
+                                    ("<<", a << b if b < 32 else None)):
+                        if val is not None and val % M32 == x:
+                            vconsts[x] = g.flex(op, va, vb)
+                            return
+            for a, va in have:
+                for b, vb in have:
+                    for c, vc_ in have:
+                        if (a * b + c) % M32 == x:
+                            vconsts[x] = g.madd(va, vb, vc_)
+                            return
+            vc_make(x, "misc")
+
         def vc_make(x, kind):
             if kind in self.MEM_KINDS and mem_bcast:
                 vconsts[x] = mem_bcast[0](x)
@@ -781,6 +800,20 @@ class KernelBuilder:
                 vconsts[x] = flow_bcast(lambda d, k: g.alu("+", d, k, *src, g.zero, 0))
             else:
                 vconsts[x] = g.broadcast(*sc(x), flex=self.FLEX_BCAST)
+
+        if self.VSYNTH:
+            # x == x is 1 in every lane whatever the words hold, so this needs no
+            # input: a vector of ones from cycle 0. The listed small constants are
+            # then made from it and each other with one op each (no scalar constant
+            # or broadcast), and word 0 of each serves as the scalar constant too.
+            ones = g.flex("==", g.zero, g.zero)
+            vconsts[1] = ones
+            for x in (1,) + tuple(self.VSYNTH):
+                x %= M32
+                if x not in vconsts:
+                    vsynth(x)
+                g.known[(vconsts[x], 0)] = x
+                consts.setdefault(x, (vconsts[x], 0))
 
         def addresses(base_addr, count, stride):
             """count scalar addresses base_addr + stride*i as (register, word), built
@@ -1168,6 +1201,7 @@ class KernelBuilder:
     CST_FLOW = True          # constants may use the flow slot (add_imm)
     REG_ADDRS = False        # addresses join the constants (anchors derive from them)
     DUAL_BCAST = False       # flow broadcasts may run as VALU broadcasts instead
+    VSYNTH = ()              # vector constants made from a vector of ones, in order
     FLOW_BCAST = ()          # kinds of vector constants made by a flow vselect (see
                              # flow_bcast): "node", "hash", "misc", "scale", "sel"
     MEM_BCAST_AREAS = 3      # staging areas used for that
